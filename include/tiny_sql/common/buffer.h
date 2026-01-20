@@ -281,6 +281,54 @@ public:
         return result;
     }
 
+    // 读取指定长度并移除
+    std::vector<uint8_t> retrieve(size_t len) {
+        if (readableBytes() < len) {
+            throw std::runtime_error("Buffer: not enough data to retrieve");
+        }
+        std::vector<uint8_t> result(data_.begin() + read_index_,
+                                    data_.begin() + read_index_ + len);
+        read_index_ += len;
+        return result;
+    }
+
+    // 追加数据
+    void append(const uint8_t* data, size_t len) {
+        ensureWritable(len);
+        data_.insert(data_.end(), data, data + len);
+        write_index_ += len;
+    }
+
+    void append(const std::vector<uint8_t>& data) {
+        append(data.data(), data.size());
+    }
+
+    // 获取读指针位置
+    size_t readerIndex() const {
+        return read_index_;
+    }
+
+    // 设置读指针位置
+    void setReaderIndex(size_t index) {
+        if (index > write_index_) {
+            throw std::runtime_error("Buffer: invalid reader index");
+        }
+        read_index_ = index;
+    }
+
+    // 获取写指针位置
+    size_t writerIndex() const {
+        return write_index_;
+    }
+
+    // 获取lenenc int的编码长度（用于计算大小）
+    static size_t getLenencIntSize(uint64_t val) {
+        if (val < 0xFB) return 1;
+        else if (val < 0x10000) return 3;
+        else if (val < 0x1000000) return 4;
+        else return 9;
+    }
+
     // 从文件描述符读取数据
     ssize_t readFromFd(int fd);
 

@@ -5,6 +5,9 @@
 
 #ifdef __linux__
 
+// 在命名空间外包含系统头文件
+#include <sys/epoll.h>
+
 namespace tiny_sql {
 
 class EpollEventLoop : public EventLoop {
@@ -30,7 +33,7 @@ private:
 
     int epoll_fd_;
     int max_events_;
-    std::vector<struct epoll_event> events_;
+    std::vector<::epoll_event> events_;  // 使用全局epoll_event
     int ready_count_;
 };
 

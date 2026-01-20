@@ -38,7 +38,7 @@ enum class FieldType : uint8_t {
 };
 
 // MySQL命令类型
-enum class Command : uint8_t {
+enum class MySQLCommand : uint8_t {
     COM_SLEEP = 0x00,
     COM_QUIT = 0x01,
     COM_INIT_DB = 0x02,
@@ -72,5 +72,8 @@ enum class Command : uint8_t {
     COM_BINLOG_DUMP_GTID = 0x1e,
     COM_RESET_CONNECTION = 0x1f
 };
+
+// 向后兼容的别名
+using Command = MySQLCommand;
 
 } // namespace tiny_sql
