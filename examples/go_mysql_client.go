@@ -35,7 +35,7 @@ func testBasicConnection() {
 	fmt.Println("\n基本连接测试:")
 
 	// 连接字符串格式: username:password@tcp(host:port)/database
-	dsn := "root:@tcp(localhost:3307)/test"
+	dsn := "root:@tcp(localhost:3306)/test"
 
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {

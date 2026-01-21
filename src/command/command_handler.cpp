@@ -4,6 +4,7 @@
 #include "tiny_sql/common/logger.h"
 #include "tiny_sql/sql/parser.h"
 #include "tiny_sql/storage/storage_engine.h"
+#include "tiny_sql/storage/expression_evaluator.h"
 #include <algorithm>
 #include <string>
 #include <cctype>
@@ -171,14 +172,202 @@ bool QueryCommandHandler::handleCommand(MySQLCommand command,
 bool QueryCommandHandler::executeSelect(const SelectStatement* stmt,
                                        Session& session,
                                        ResponseCallback response_callback) {
-    // 暂时返回简单的OK响应，表示查询成功但无结果
     LOG_INFO("Executing SELECT: " << stmt->toString());
 
     Buffer response;
-    std::string result = "SELECT executed (result set not implemented yet): ";
-    result += stmt->toString();
-    OkPacket ok_packet(0, 0, ServerStatus::SERVER_STATUS_AUTOCOMMIT, 0, result);
-    ok_packet.encode(response, session.nextSequenceId());
+
+    // 1. 获取当前数据库
+    // Get current database
+    const std::string& db_name = session.getCurrentDatabase();
+    if (db_name.empty()) {
+        ErrPacket err_packet(1046, "3D000", "No database selected");
+        err_packet.encode(response, session.nextSequenceId());
+        response_callback(response);
+        return true;
+    }
+
+    // 2. 获取数据库和表
+    // Get database and table
+    auto& storage = StorageEngine::instance();
+    auto db = storage.getDatabase(db_name);
+    if (!db) {
+        ErrPacket err_packet(1049, "42000", "Unknown database '" + db_name + "'");
+        err_packet.encode(response, session.nextSequenceId());
+        response_callback(response);
+        return true;
+    }
+
+    const std::string& table_name = stmt->getTableName();
+    auto table = db->getTable(table_name);
+    if (!table) {
+        ErrPacket err_packet(1146, "42S02",
+            "Table '" + db_name + "." + table_name + "' doesn't exist");
+        err_packet.encode(response, session.nextSequenceId());
+        response_callback(response);
+        return true;
+    }
+
+    // 3. 确定要返回的列
+    // Determine which columns to return
+    std::vector<ColumnDef> result_columns;
+    std::vector<size_t> column_indices;
+
+    if (stmt->getColumns().size() == 1) {
+        auto* first_col = dynamic_cast<const Identifier*>(stmt->getColumns()[0].get());
+        if (first_col && first_col->getName() == "*") {
+            // SELECT * - 所有列
+            // SELECT * - all columns
+            result_columns = table->getColumns();
+            for (size_t i = 0; i < result_columns.size(); ++i) {
+                column_indices.push_back(i);
+            }
+        } else {
+            // 单个特定列
+            // Single specific column
+            if (!first_col) {
+                ErrPacket err_packet(1064, "42000", "Invalid column expression");
+                err_packet.encode(response, session.nextSequenceId());
+                response_callback(response);
+                return true;
+            }
+
+            int col_idx = table->getColumnIndex(first_col->getName());
+            if (col_idx < 0) {
+                ErrPacket err_packet(1054, "42S22",
+                    "Unknown column '" + first_col->getName() + "' in 'field list'");
+                err_packet.encode(response, session.nextSequenceId());
+                response_callback(response);
+                return true;
+            }
+
+            result_columns.push_back(table->getColumns()[col_idx]);
+            column_indices.push_back(col_idx);
+        }
+    } else {
+        // 多个特定列
+        // Multiple specific columns
+        for (const auto& col_expr : stmt->getColumns()) {
+            auto* id = dynamic_cast<const Identifier*>(col_expr.get());
+            if (!id) {
+                ErrPacket err_packet(1064, "42000", "Invalid column expression");
+                err_packet.encode(response, session.nextSequenceId());
+                response_callback(response);
+                return true;
+            }
+
+            int col_idx = table->getColumnIndex(id->getName());
+            if (col_idx < 0) {
+                ErrPacket err_packet(1054, "42S22",
+                    "Unknown column '" + id->getName() + "' in 'field list'");
+                err_packet.encode(response, session.nextSequenceId());
+                response_callback(response);
+                return true;
+            }
+
+            result_columns.push_back(table->getColumns()[col_idx]);
+            column_indices.push_back(col_idx);
+        }
+    }
+
+    // 4. 使用WHERE子句过滤行
+    // Filter rows with WHERE clause
+    std::vector<Row> filtered_rows;
+    const Expression* where_clause = stmt->getWhereClause();
+
+    for (const auto& row : table->getRows()) {
+        bool matches = true;
+
+        if (where_clause) {
+            try {
+                matches = ExpressionEvaluator::evaluate(
+                    where_clause, row, table->getColumns()
+                );
+            } catch (const std::exception& e) {
+                ErrPacket err_packet(1064, "42000",
+                    "Error evaluating WHERE clause: " + std::string(e.what()));
+                err_packet.encode(response, session.nextSequenceId());
+                response_callback(response);
+                return true;
+            }
+        }
+
+        if (matches) {
+            filtered_rows.push_back(row);
+        }
+    }
+
+    // 5. 应用LIMIT和OFFSET
+    // Apply LIMIT and OFFSET
+    size_t offset = stmt->getOffset();
+    int limit = stmt->getLimit();
+
+    if (offset >= filtered_rows.size()) {
+        filtered_rows.clear();
+    } else {
+        if (offset > 0) {
+            filtered_rows.erase(filtered_rows.begin(),
+                              filtered_rows.begin() + offset);
+        }
+
+        if (limit >= 0 && static_cast<size_t>(limit) < filtered_rows.size()) {
+            filtered_rows.resize(limit);
+        }
+    }
+
+    LOG_INFO("SELECT result: " << filtered_rows.size() << " rows matched");
+
+    // 6. 发送结果集
+    // Send result set
+
+    // 6a. 列数包
+    // Column count packet
+    Buffer col_count_buffer;
+    col_count_buffer.writeLenencInt(result_columns.size());
+
+    // 写入列数包的头部
+    // Write column count packet header
+    uint32_t col_count_len = static_cast<uint32_t>(col_count_buffer.readableBytes());
+    // Payload length (3 bytes, little-endian)
+    response.writeUint8(col_count_len & 0xFF);
+    response.writeUint8((col_count_len >> 8) & 0xFF);
+    response.writeUint8((col_count_len >> 16) & 0xFF);
+    response.writeUint8(session.nextSequenceId());  // sequence id
+    response.append(col_count_buffer.peek(), col_count_buffer.readableBytes());
+
+    // 6b. 列定义包
+    // Column definition packets
+    for (const auto& col : result_columns) {
+        ColumnDefinitionPacket col_def =
+            ColumnDefinitionPacket::fromColumnDef(col, table_name, db_name);
+        col_def.encode(response, session.nextSequenceId());
+    }
+
+    // 6c. 列定义后的EOF包
+    // EOF packet after column definitions
+    EofPacket eof1(0, ServerStatus::SERVER_STATUS_AUTOCOMMIT);
+    eof1.encode(response, session.nextSequenceId());
+
+    // 6d. 行数据包
+    // Row data packets
+    for (const auto& row : filtered_rows) {
+        // 投影选定的列
+        // Project only selected columns
+        Row projected_row;
+        for (size_t idx : column_indices) {
+            projected_row.addValue(row.getValue(idx));
+        }
+
+        TextResultRowPacket row_packet(projected_row);
+        row_packet.encode(response, session.nextSequenceId());
+    }
+
+    // 6e. 最终EOF包
+    // Final EOF packet
+    EofPacket eof2(0, ServerStatus::SERVER_STATUS_AUTOCOMMIT);
+    eof2.encode(response, session.nextSequenceId());
+
+    // 发送响应
+    // Send response
     response_callback(response);
     return true;
 }

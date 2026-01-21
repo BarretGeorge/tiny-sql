@@ -296,4 +296,275 @@ PacketType identifyPacketType(Buffer& buffer) {
     return PacketType::UNKNOWN;
 }
 
+// ==================== Helper Functions ====================
+
+/**
+ * 将DataType转换为MySQL字段类型
+ * Convert DataType to MySQL field type
+ */
+static uint8_t dataTypeToMySQLType(DataType type) {
+    switch (type) {
+        case DataType::INT:
+            return MySQLFieldType::MYSQL_TYPE_LONG;
+        case DataType::BIGINT:
+            return MySQLFieldType::MYSQL_TYPE_LONGLONG;
+        case DataType::FLOAT:
+            return MySQLFieldType::MYSQL_TYPE_FLOAT;
+        case DataType::DOUBLE:
+            return MySQLFieldType::MYSQL_TYPE_DOUBLE;
+        case DataType::VARCHAR:
+        case DataType::TEXT:
+            return MySQLFieldType::MYSQL_TYPE_STRING;
+        case DataType::BOOLEAN:
+            return MySQLFieldType::MYSQL_TYPE_TINY;
+        case DataType::NULL_TYPE:
+        default:
+            return MySQLFieldType::MYSQL_TYPE_STRING;
+    }
+}
+
+/**
+ * 获取列的最大长度
+ * Get maximum length for a column
+ */
+static uint32_t getColumnLength(DataType type) {
+    switch (type) {
+        case DataType::INT:
+            return 11;  // -2147483648
+        case DataType::BIGINT:
+            return 20;  // -9223372036854775808
+        case DataType::FLOAT:
+            return 12;
+        case DataType::DOUBLE:
+            return 22;
+        case DataType::BOOLEAN:
+            return 1;
+        case DataType::VARCHAR:
+            return 255;
+        case DataType::TEXT:
+            return 65535;
+        case DataType::NULL_TYPE:
+        default:
+            return 0;
+    }
+}
+
+// ==================== ColumnDefinitionPacket ====================
+
+ColumnDefinitionPacket::ColumnDefinitionPacket()
+    : catalog_("def")
+    , schema_("")
+    , table_("")
+    , org_table_("")
+    , name_("")
+    , org_name_("")
+    , charset_(MySQLCharset::UTF8_GENERAL_CI)
+    , column_length_(0)
+    , column_type_(MySQLFieldType::MYSQL_TYPE_STRING)
+    , flags_(0)
+    , decimals_(0)
+{}
+
+ColumnDefinitionPacket::ColumnDefinitionPacket(
+    const std::string& catalog,
+    const std::string& schema,
+    const std::string& table,
+    const std::string& org_table,
+    const std::string& name,
+    const std::string& org_name,
+    uint16_t charset,
+    uint32_t column_length,
+    uint8_t column_type,
+    uint16_t flags,
+    uint8_t decimals)
+    : catalog_(catalog)
+    , schema_(schema)
+    , table_(table)
+    , org_table_(org_table)
+    , name_(name)
+    , org_name_(org_name)
+    , charset_(charset)
+    , column_length_(column_length)
+    , column_type_(column_type)
+    , flags_(flags)
+    , decimals_(decimals)
+{}
+
+ColumnDefinitionPacket ColumnDefinitionPacket::fromColumnDef(
+    const ColumnDef& col,
+    const std::string& table_name,
+    const std::string& db_name) {
+
+    uint16_t flags = 0;
+    if (col.not_null) {
+        flags |= ColumnFlags::NOT_NULL_FLAG;
+    }
+    if (col.primary_key) {
+        flags |= ColumnFlags::PRI_KEY_FLAG;
+    }
+    if (col.auto_increment) {
+        flags |= ColumnFlags::AUTO_INCREMENT_FLAG;
+    }
+
+    return ColumnDefinitionPacket(
+        "def",                              // catalog
+        db_name,                            // schema
+        table_name,                         // table
+        table_name,                         // org_table
+        col.name,                           // name
+        col.name,                           // org_name
+        MySQLCharset::UTF8_GENERAL_CI,     // charset
+        getColumnLength(col.type),          // column_length
+        dataTypeToMySQLType(col.type),     // column_type
+        flags,                              // flags
+        0                                   // decimals
+    );
+}
+
+bool ColumnDefinitionPacket::decode(Buffer& buffer) {
+    // 解码暂不实现（服务器只需encode）
+    // Decode not implemented (server only needs encode)
+    return false;
+}
+
+void ColumnDefinitionPacket::encode(Buffer& buffer, uint8_t sequence_id) {
+    Buffer payload;
+
+    // catalog (length-encoded string)
+    payload.writeLenencString(catalog_);
+
+    // schema (length-encoded string)
+    payload.writeLenencString(schema_);
+
+    // table (length-encoded string)
+    payload.writeLenencString(table_);
+
+    // org_table (length-encoded string)
+    payload.writeLenencString(org_table_);
+
+    // name (length-encoded string)
+    payload.writeLenencString(name_);
+
+    // org_name (length-encoded string)
+    payload.writeLenencString(org_name_);
+
+    // fixed length fields (0x0c)
+    payload.writeUint8(0x0c);
+
+    // charset (2 bytes, little-endian)
+    payload.writeUint16(charset_);
+
+    // column_length (4 bytes, little-endian)
+    payload.writeUint32(column_length_);
+
+    // type (1 byte)
+    payload.writeUint8(column_type_);
+
+    // flags (2 bytes, little-endian)
+    payload.writeUint16(flags_);
+
+    // decimals (1 byte)
+    payload.writeUint8(decimals_);
+
+    // filler (2 bytes, 0x00 0x00)
+    payload.writeUint16(0x0000);
+
+    // 写包头和payload
+    // Write header and payload
+    writeHeader(buffer, static_cast<uint32_t>(payload.readableBytes()), sequence_id);
+    buffer.append(payload.peek(), payload.readableBytes());
+}
+
+size_t ColumnDefinitionPacket::getPayloadLength() const {
+    size_t len = 0;
+
+    // lenenc strings
+    len += 1 + catalog_.size();
+    len += 1 + schema_.size();
+    len += 1 + table_.size();
+    len += 1 + org_table_.size();
+    len += 1 + name_.size();
+    len += 1 + org_name_.size();
+
+    // fixed length fields
+    len += 1;  // 0x0c
+    len += 2;  // charset
+    len += 4;  // column_length
+    len += 1;  // type
+    len += 2;  // flags
+    len += 1;  // decimals
+    len += 2;  // filler
+
+    return len;
+}
+
+// ==================== TextResultRowPacket ====================
+
+TextResultRowPacket::TextResultRowPacket()
+{}
+
+TextResultRowPacket::TextResultRowPacket(const Row& row) {
+    for (size_t i = 0; i < row.getColumnCount(); ++i) {
+        values_.push_back(row.getValue(i));
+    }
+}
+
+bool TextResultRowPacket::decode(Buffer& buffer) {
+    // 解码暂不实现（服务器只需encode）
+    // Decode not implemented (server only needs encode)
+    return false;
+}
+
+void TextResultRowPacket::encode(Buffer& buffer, uint8_t sequence_id) {
+    Buffer payload;
+
+    // 对每个值编码为length-encoded string
+    // Encode each value as length-encoded string
+    for (const auto& value : values_) {
+        if (value.isNull()) {
+            // NULL值用0xFB表示
+            // NULL value is represented by 0xFB
+            payload.writeUint8(0xFB);
+        } else {
+            // 其他值转换为字符串后用length-encoded string编码
+            // Other values converted to string then encoded as length-encoded string
+            std::string str = value.toString();
+            payload.writeLenencString(str);
+        }
+    }
+
+    // 写包头和payload
+    // Write header and payload
+    writeHeader(buffer, static_cast<uint32_t>(payload.readableBytes()), sequence_id);
+    buffer.append(payload.peek(), payload.readableBytes());
+}
+
+size_t TextResultRowPacket::getPayloadLength() const {
+    size_t len = 0;
+
+    for (const auto& value : values_) {
+        if (value.isNull()) {
+            len += 1;  // 0xFB
+        } else {
+            std::string str = value.toString();
+            // lenenc string: length + data
+            if (str.size() < 251) {
+                len += 1 + str.size();
+            } else if (str.size() < 65536) {
+                len += 3 + str.size();
+            } else if (str.size() < 16777216) {
+                len += 4 + str.size();
+            } else {
+                len += 9 + str.size();
+            }
+        }
+    }
+
+    return len;
+}
+
+void TextResultRowPacket::addValue(const Value& value) {
+    values_.push_back(value);
+}
+
 } // namespace tiny_sql
